@@ -1,0 +1,28 @@
+{
+  "name": "ethereum-graph-analysis",
+  "version": "1.0.0",
+  "description": "Interactive Ethereum Transaction Graph Analysis Dashboard",
+  "main": "index.html",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'Static site - no build needed'",
+    "deploy": "vercel --prod"
+  },
+  "keywords": [
+    "ethereum",
+    "blockchain",
+    "graph-analysis",
+    "network-analysis",
+    "cryptocurrency",
+    "data-visualization"
+  ],
+  "author": "Opportunity Insights",
+  "license": "MIT",
+  "devDependencies": {
+    "vercel": "^32.0.0"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.0",
+    "d3": "^7.8.5"
+  }
+}

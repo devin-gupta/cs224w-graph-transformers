@@ -1,69 +1,114 @@
-# CS224W Graph Learning - Ethereum Transaction Analysis
+# Ethereum Transaction Graph Analysis Dashboard
 
-This repository contains graph analysis of Ethereum transaction data, exploring network structures and transaction patterns using NetworkX and various graph learning techniques.
+A comprehensive web dashboard showcasing Ethereum transaction network analysis using graph theory and network analysis techniques.
 
-## Overview
+## 🚀 Quick Deploy to Vercel
 
-The project analyzes Ethereum transaction data centered around a specific root address, examining:
-- Transaction network topology
-- Hub and spoke patterns in financial networks
-- Value flow analysis
-- Centrality measures and network properties
+### Option 1: Deploy via Vercel CLI (Recommended)
 
-## Files
-
-- `ethereum_exploration.ipynb` - Main analysis notebook with comprehensive graph analysis
-- `ethereum_small.csv` - Sample Ethereum transaction data (149 transactions)
-- `commuting_zone_characteristics.csv` - Additional dataset for analysis
-- `graph_transformer_analysis.ipynb` - Advanced graph transformer analysis
-- `requirements.txt` - Python dependencies
-
-## Key Features
-
-### Graph Construction
-- Directed graph with Ethereum addresses as nodes
-- Edge features: transaction count, total value, average value
-- NetworkX-based implementation
-
-### Analysis Components
-- **Graph Statistics**: Node/edge counts, density, degree distributions
-- **Hub Analysis**: Identification of high-degree and high-value nodes
-- **Visualizations**: Full graph, local subgraphs, degree distributions, value flow
-- **Interactive Tools**: Address analysis, subgraph extraction, path finding
-
-### Visualizations
-1. Full graph overview with node sizes by degree
-2. Local subgraph around root node (2-hop neighborhood)
-3. Degree distribution histograms
-4. Value flow diagram highlighting high-value transactions
-
-## Usage
-
-1. Install dependencies:
+1. **Install Vercel CLI** (if not already installed):
    ```bash
-   pip install -r requirements.txt
+   npm install -g vercel
    ```
 
-2. Open and run `ethereum_exploration.ipynb` for the main analysis
+2. **Login to Vercel**:
+   ```bash
+   vercel login
+   ```
 
-3. Use helper functions for interactive exploration:
-   - `get_address_info(address)` - Analyze specific addresses
-   - `extract_subgraph_by_criteria()` - Filter graphs by various criteria
-   - `find_paths_between_addresses()` - Find transaction paths
-   - `analyze_centrality_measures()` - Calculate centrality metrics
+3. **Deploy the project**:
+   ```bash
+   vercel --prod
+   ```
 
-## Data Source
+### Option 2: Deploy via Vercel Dashboard
 
-The Ethereum transaction data was generated using BigQuery with a recursive CTE to find 2-hop neighbors around a root address, spanning approximately one month of transactions.
+1. Go to [vercel.com](https://vercel.com) and sign in
+2. Click "New Project"
+3. Import your GitHub repository or drag and drop the project folder
+4. Vercel will automatically detect it as a static site
+5. Click "Deploy"
 
-## Technologies Used
+## 📊 Project Overview
 
-- Python
-- NetworkX (graph analysis)
-- Pandas (data manipulation)
-- Matplotlib (visualization)
-- Jupyter Notebooks
+This dashboard presents a comprehensive analysis of Ethereum transaction data including:
 
-## Course Context
+- **149 transactions** analyzed over 30 days
+- **91 unique addresses** in the network
+- **Interactive visualizations** showing network evolution
+- **Graph theory analysis** with centrality measures
+- **Temporal analysis** of network growth
 
-This project is part of CS224W (Graph Learning) coursework, demonstrating practical applications of graph theory and network analysis in blockchain transaction data.
+## 🔬 Methodology
+
+The analysis employs advanced graph theory techniques:
+
+- **NetworkX** for graph construction and analysis
+- **Directed weighted graphs** with transaction metadata
+- **Centrality measures**: Degree, Betweenness, PageRank
+- **Temporal evolution** tracking network growth
+- **Interactive visualizations** using Chart.js and D3.js
+
+## 📈 Key Findings
+
+- **Hub-and-spoke pattern**: One dominant address receives 75% of transactions
+- **Low network density**: 0.0112, typical of financial networks
+- **Centralized value flow**: Significant concentration in high-volume edges
+- **Temporal growth**: Steady expansion from 11 to 91 nodes over 30 days
+
+## 🛠️ Technical Stack
+
+- **Frontend**: HTML5, CSS3, JavaScript
+- **Visualization**: Chart.js, D3.js
+- **Styling**: Tailwind CSS
+- **Deployment**: Vercel
+- **Analysis**: Python (NetworkX, Pandas, Matplotlib)
+
+## 📁 Project Structure
+
+```
+├── index.html          # Main dashboard page
+├── package.json        # Project dependencies
+├── vercel.json         # Vercel configuration
+├── ethereum_small.csv  # Transaction data
+├── ethereum_exploration.ipynb  # Analysis notebook
+└── ethereum_graph_evolution.gif # Network animation
+```
+
+## 🎯 Features
+
+- **Responsive Design**: Works on desktop and mobile
+- **Interactive Charts**: Degree distribution, growth over time, value analysis
+- **Network Animation**: Shows temporal evolution of the transaction network
+- **Comprehensive Methodology**: Detailed explanation of analysis techniques
+- **Professional Presentation**: Ready for stakeholder presentations
+
+## 🔗 Live Demo
+
+Once deployed, your dashboard will be available at:
+`https://your-project-name.vercel.app`
+
+## 📝 Customization
+
+To customize the dashboard:
+
+1. **Update data**: Replace `ethereum_small.csv` with your data
+2. **Modify charts**: Edit the JavaScript section in `index.html`
+3. **Change styling**: Update CSS classes and Tailwind utilities
+4. **Add sections**: Extend the HTML structure as needed
+
+## 🤝 Contributing
+
+This project demonstrates blockchain transaction analysis techniques. Feel free to:
+- Fork the repository
+- Add new analysis methods
+- Improve visualizations
+- Extend to other blockchain networks
+
+## 📄 License
+
+MIT License - feel free to use for research and educational purposes.
+
+---
+
+**Built with ❤️ for blockchain network analysis**

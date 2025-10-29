@@ -53,3 +53,4 @@ Thumbs.db
 # *.csv
 # *.json
 # *.pkl
+.vercel
