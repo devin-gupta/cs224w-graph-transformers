@@ -1,5 +1,5 @@
 data/ethereum_medium.csv
-analysis/ethereum_medium.csv
+analysis/*.csv
 
 # Python
 __pycache__/
