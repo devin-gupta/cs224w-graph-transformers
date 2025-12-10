@@ -114,7 +114,8 @@ class LightGCN(nn.Module):
         self.num_nodes = num_nodes
         self.num_layers = num_layers
         self.embedding = nn.Embedding(num_nodes, embedding_dim)
-        nn.init.xavier_uniform_(self.embedding.weight)
+        # Better initialization: scale by sqrt of embedding_dim to prevent collapse
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
 
     def propagate(self, edge_index, x):
         row, col = edge_index
@@ -129,6 +130,10 @@ class LightGCN(nn.Module):
         out = [x]
         for _ in range(self.num_layers):
             x = self.propagate(edge_index, x)
+            # Add residual connection to prevent vanishing gradients
+            x = x + out[-1] if len(out) > 0 else x
+            # L2 normalize to prevent embedding collapse
+            x = F.normalize(x, p=2, dim=1)
             out.append(x)
         return torch.stack(out, dim=0).mean(dim=0)
 
@@ -138,7 +143,7 @@ class LightGCN(nn.Module):
         return (src * dst).sum(dim=1)
 
 class BPRLoss(nn.Module):
-    def __init__(self, lambda_reg: float = 1e-4):
+    def __init__(self, lambda_reg: float = 1e-5):
         super().__init__()
         self.lambda_reg = lambda_reg
 
@@ -165,13 +170,12 @@ def train_one_epoch_bpr(
     num_pos = train_labels.size(1)
     total_loss = 0.0
 
-    loss_fn = BPRLoss(lambda_reg=1e-4)
-    
-    # Generate embeddings ONCE for the entire epoch (much faster!)
-    with torch.no_grad():  # Temporarily no grad for embedding generation
-        emb = model(mp_edge_index)
+    loss_fn = BPRLoss(lambda_reg=1e-5)  # Reduced regularization
     
     num_batches = (num_pos + batch_size - 1) // batch_size
+    
+    # Debug: Track gradient norms and embedding changes
+    first_batch = True
     
     for batch_idx, start in enumerate(range(0, num_pos, batch_size)):
         end = min(start + batch_size, num_pos)
@@ -181,7 +185,11 @@ def train_one_epoch_bpr(
         # 1. Zero gradients
         optimizer.zero_grad()
 
-        # 2. Sample negatives (using pre-computed embeddings)
+        # 2. Generate embeddings WITH gradients (CRITICAL FIX!)
+        # This allows gradients to flow back to embedding parameters
+        emb = model(mp_edge_index)
+
+        # 3. Sample negatives
         neg_edge_index = sample_hard_negative_edges_grouped(
             batch_src=batch_src,
             adj=global_adj, 
@@ -192,18 +200,30 @@ def train_one_epoch_bpr(
         neg_src = neg_edge_index[0].view(end - start, num_neg)
         neg_dst = neg_edge_index[1].view(end - start, num_neg)
 
-        # 3. Calculate scores using pre-computed embeddings
+        # 4. Calculate scores using embeddings
         pos_score = (emb[batch_src] * emb[batch_dst]).sum(dim=1, keepdim=True)
         neg_score = (emb[neg_src] * emb[neg_dst]).sum(dim=2)
 
-        # 4. Compute loss and step
+        # 5. Compute loss and step
         loss = loss_fn(pos_score, neg_score, emb_params=model.embedding.weight)
         loss.backward()
-        optimizer.step()
         
-        # Update embeddings after gradient step (for next batch)
-        with torch.no_grad():
-            emb = model(mp_edge_index)
+        # Gradient clipping to prevent vanishing/exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # Debug: Check gradients on first batch
+        if first_batch:
+            grad_norm = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_norm += param.grad.data.norm(2).item() ** 2
+            grad_norm = grad_norm ** 0.5
+            print(f"  First batch gradient norm: {grad_norm:.6f}")
+            print(f"  First batch pos_score mean: {pos_score.mean().item():.4f}, neg_score mean: {neg_score.mean().item():.4f}")
+            print(f"  First batch score diff: {(pos_score - neg_score).mean().item():.4f}")
+            first_batch = False
+        
+        optimizer.step()
 
         total_loss += loss.item() * (end - start)
         
@@ -214,13 +234,13 @@ def train_one_epoch_bpr(
     avg_loss = total_loss / num_pos
     return avg_loss
 
-def build_next_labels_from_splits(train_data, val_data, test_data):
+def build_next_labels_from_splits(train_edge_index, train_edge_times, val_data, test_data):
     """Construct the next-edge per node after train/val for evaluation."""
-    train_end = train_data.edge_attr[:,2].max().item()
+    train_end = train_edge_times.max().item()
     val_end = val_data.edge_attr[:,2].max().item()
 
-    all_edge_index = torch.cat([train_data.edge_index, val_data.edge_index, test_data.edge_index], dim=1)
-    all_times = torch.cat([train_data.edge_attr[:,2], val_data.edge_attr[:,2], test_data.edge_attr[:,2]], dim=0)
+    all_edge_index = torch.cat([train_edge_index, val_data.edge_index, test_data.edge_index], dim=1)
+    all_times = torch.cat([train_edge_times, val_data.edge_attr[:,2], test_data.edge_attr[:,2]], dim=0)
     per_src = edges_to_sorted_lists(all_edge_index, all_times)
 
     val_src, val_dst = [], []
@@ -269,22 +289,49 @@ print("\n" + "="*60)
 print("SETTING UP TRAINING DATA")
 print("="*60)
 
+# QUICK ITERATION MODE: Use subset of data for faster debugging
+USE_SUBSET = True  # Set to False to use full dataset
+SUBSET_FRAC = 0.1  # Use 10% of training edges for quick iteration
+
 num_nodes = train_data.x.size(0)
 mp_edge_index = train_data.edge_index
+train_edge_times = train_data.edge_attr[:, 2]  # Extract times before any subsetting
+
+if USE_SUBSET:
+    print(f"⚠️  QUICK ITERATION MODE: Using {SUBSET_FRAC*100:.0f}% of training data")
+    num_edges_to_use = int(mp_edge_index.size(1) * SUBSET_FRAC)
+    mp_edge_index = mp_edge_index[:, :num_edges_to_use]
+    # Also subset edge_attr times to match
+    train_edge_times = train_edge_times[:num_edges_to_use]
+
 print(f"Number of nodes: {num_nodes:,}")
 print(f"Training edges: {mp_edge_index.size(1):,}")
 
 print("Building training labels...")
 start_time = time.time()
 train_labels = build_any_future_labels_within_window(
-    train_data.edge_index, train_data.edge_attr[:, 2]
+    mp_edge_index, train_edge_times
 )
 print(f"Training labels built in {time.time() - start_time:.2f}s")
 print(f"Number of positive pairs: {train_labels.size(1):,}")
 
+# Further subset training labels if too many
+if USE_SUBSET and train_labels.size(1) > 10000:
+    max_labels = 10000
+    print(f"Subsetting training labels to {max_labels:,} for quick iteration")
+    perm = torch.randperm(train_labels.size(1))[:max_labels]
+    train_labels = train_labels[:, perm]
+    print(f"Using {train_labels.size(1):,} training pairs")
+
 print("Building validation/test labels...")
 start_time = time.time()
-val_labels, test_labels = build_next_labels_from_splits(train_data, val_data, test_data)
+# Pass the subset edge_index and edge_attr times (or full if not using subset)
+val_labels, test_labels = build_next_labels_from_splits(
+    mp_edge_index,  # Use the (possibly subset) edge_index
+    train_edge_times,  # Use the (possibly subset) edge_attr times
+    val_data, 
+    test_data
+)
 print(f"Val/Test labels built in {time.time() - start_time:.2f}s")
 print(f"Validation labels: {val_labels.size(1):,}, Test labels: {test_labels.size(1):,}")
 
@@ -307,7 +354,8 @@ print("\n" + "="*60)
 print("INITIALIZING MODEL")
 print("="*60)
 model = LightGCN(num_nodes=num_nodes, embedding_dim=64, num_layers=3).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+# Increased learning rate to help escape flat regions
+optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
 num_params = sum(p.numel() for p in model.parameters())
 print(f"Model initialized with {num_params:,} parameters")
 print(f"Model moved to: {next(model.parameters()).device}")
@@ -316,9 +364,15 @@ print("\n" + "="*60)
 print("STARTING TRAINING")
 print("="*60)
 
-for epoch in range(1):
+num_epochs = 10 if not USE_SUBSET else 100  # Fewer epochs for quick iteration
+
+for epoch in range(num_epochs):
     epoch_start = time.time()
-    print(f"\nEpoch {epoch+1}/1")
+    print(f"\nEpoch {epoch+1}/{num_epochs}")
+    
+    # Track embedding changes to verify learning
+    if epoch == 0:
+        emb_before = model.embedding.weight.data.clone()
     
     # FIXED: Pass mp_edge_index for message passing
     loss = train_one_epoch_bpr(
@@ -331,10 +385,18 @@ for epoch in range(1):
         device=device
     )
     
+    # Check if embeddings changed
+    if epoch == 0:
+        emb_after = model.embedding.weight.data
+        emb_change = (emb_after - emb_before).abs().mean().item()
+        print(f"  Embedding change after epoch 0: {emb_change:.6f}")
+    
     epoch_time = time.time() - epoch_start
     print(f"\nEpoch {epoch} completed in {epoch_time:.2f}s | Loss: {loss:.4f}")
 
-    if epoch % 5 == 0 or epoch == 49:
+    # Evaluate more frequently in quick iteration mode
+    eval_freq = 1 if USE_SUBSET else 5
+    if epoch % eval_freq == 0 or epoch == num_epochs - 1:
         print("Running validation...")
         eval_start = time.time()
         hit10, mr = evaluate(
