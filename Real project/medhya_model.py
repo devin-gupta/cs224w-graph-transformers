@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add
 from torch_geometric.utils import degree
+from torch_geometric.nn import SAGEConv, GATConv
 
 # ==============================================================================
 # UTILITY FUNCTIONS
@@ -145,6 +146,14 @@ def sample_hard_negative_edges_grouped(batch_src, adj, num_nodes, num_neg=5, dev
 # ==============================================================================
 
 class LightGCN(nn.Module):
+    """
+    LightGCN: Simplifying and Powering Graph Convolution Network for Recommendation.
+    
+    Key characteristics:
+    - No learnable weight matrices (only embeddings)
+    - Simple normalized message passing
+    - Averages embeddings across all layers
+    """
     def __init__(self, num_nodes, embedding_dim=64, num_layers=3):
         super().__init__()
         self.num_nodes = num_nodes
@@ -169,6 +178,81 @@ class LightGCN(nn.Module):
             x = F.normalize(x, p=2, dim=1)
             out.append(x)
         return torch.stack(out, dim=0).mean(dim=0)
+
+    def score(self, emb, edge_index):
+        src = emb[edge_index[0]]
+        dst = emb[edge_index[1]]
+        return (src * dst).sum(dim=1)
+
+
+class GraphSAGE(nn.Module):
+    """
+    GraphSAGE: Inductive Representation Learning on Large Graphs.
+    
+    Key characteristics:
+    - Learnable weight matrices at each layer
+    - Mean aggregation of neighbor features
+    - ReLU activation between layers
+    """
+    def __init__(self, num_nodes, embedding_dim=64, hidden_dim=64, num_layers=2):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(num_nodes, embedding_dim)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
+        
+        self.convs = nn.ModuleList()
+        self.convs.append(SAGEConv(embedding_dim, hidden_dim))
+        for _ in range(num_layers - 1):
+            self.convs.append(SAGEConv(hidden_dim, hidden_dim))
+
+    def forward(self, edge_index):
+        x = self.embedding.weight
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            if i < len(self.convs) - 1:  # No activation on last layer
+                x = F.relu(x)
+        return F.normalize(x, p=2, dim=1)
+
+    def score(self, emb, edge_index):
+        src = emb[edge_index[0]]
+        dst = emb[edge_index[1]]
+        return (src * dst).sum(dim=1)
+
+
+class GAT(nn.Module):
+    """
+    GAT: Graph Attention Networks.
+    
+    Key characteristics:
+    - Learnable attention weights between nodes
+    - Multi-head attention for stability
+    - ELU activation between layers
+    """
+    def __init__(self, num_nodes, embedding_dim=64, hidden_dim=64, num_layers=2, heads=4):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(num_nodes, embedding_dim)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
+        
+        self.convs = nn.ModuleList()
+        # First layer: embedding_dim -> hidden_dim (with multi-head)
+        self.convs.append(GATConv(embedding_dim, hidden_dim // heads, heads=heads, concat=True))
+        # Middle layers
+        for _ in range(num_layers - 2):
+            self.convs.append(GATConv(hidden_dim, hidden_dim // heads, heads=heads, concat=True))
+        # Last layer: single head for final output
+        if num_layers > 1:
+            self.convs.append(GATConv(hidden_dim, hidden_dim, heads=1, concat=False))
+
+    def forward(self, edge_index):
+        x = self.embedding.weight
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            if i < len(self.convs) - 1:  # No activation on last layer
+                x = F.elu(x)
+        return F.normalize(x, p=2, dim=1)
 
     def score(self, emb, edge_index):
         src = emb[edge_index[0]]
@@ -305,11 +389,14 @@ def load_data(data_dir):
 
 def train_pipeline(
     data_dir: str = None,
+    model_type: str = "lightgcn",
     training_mode: str = "next_link",
     use_subset: bool = True,
     subset_frac: float = 0.1,
     embedding_dim: int = 64,
+    hidden_dim: int = 64,
     num_layers: int = 3,
+    num_heads: int = 4,
     num_epochs: int = None,
     batch_size: int = 4096,
     learning_rate: float = 5e-3,
@@ -319,15 +406,18 @@ def train_pipeline(
     verbose: bool = True,
 ):
     """
-    Run the complete LightGCN training pipeline.
+    Run the complete GNN training pipeline for link prediction.
     
     Args:
         data_dir: Path to data directory. If None, uses 'Data' folder next to this script.
+        model_type: GNN architecture - "lightgcn", "graphsage", or "gat"
         training_mode: Label generation mode - "next_link" or "all_future"
         use_subset: Whether to use a subset of data for quick iteration
         subset_frac: Fraction of training edges to use if use_subset=True
-        embedding_dim: Dimension of node embeddings
-        num_layers: Number of LightGCN propagation layers
+        embedding_dim: Dimension of input node embeddings
+        hidden_dim: Hidden dimension for GraphSAGE/GAT (ignored for LightGCN)
+        num_layers: Number of GNN layers
+        num_heads: Number of attention heads for GAT (ignored for others)
         num_epochs: Number of training epochs. If None, uses 100 for subset, 10 for full.
         batch_size: Training batch size
         learning_rate: Learning rate for Adam optimizer
@@ -409,15 +499,40 @@ def train_pipeline(
     
     # ==== INITIALIZE MODEL ====
     print("\n" + "=" * 60)
-    print("INITIALIZING MODEL")
+    print(f"INITIALIZING MODEL: {model_type.upper()}")
     print("=" * 60)
     
-    model = LightGCN(num_nodes=num_nodes, embedding_dim=embedding_dim, num_layers=num_layers).to(device)
+    if model_type == "lightgcn":
+        model = LightGCN(
+            num_nodes=num_nodes,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers
+        )
+    elif model_type == "graphsage":
+        model = GraphSAGE(
+            num_nodes=num_nodes,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers
+        )
+    elif model_type == "gat":
+        model = GAT(
+            num_nodes=num_nodes,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            heads=num_heads
+        )
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}. Use 'lightgcn', 'graphsage', or 'gat'.")
+    
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model initialized with {num_params:,} parameters")
-    print(f"Model moved to: {next(model.parameters()).device}")
+    print(f"Model: {model_type}")
+    print(f"Parameters: {num_params:,}")
+    print(f"Device: {next(model.parameters()).device}")
     
     # ==== TRAINING ====
     print("\n" + "=" * 60)
@@ -490,11 +605,14 @@ def train_pipeline(
 if __name__ == "__main__":
     # Example usage - modify these parameters as needed
     results = train_pipeline(
+        model_type="lightgcn",      # "lightgcn", "graphsage", or "gat"
         training_mode="next_link",  # "next_link" or "all_future"
         use_subset=True,            # Set to False for full training
         subset_frac=0.1,            # Fraction of data when use_subset=True
         embedding_dim=64,
+        hidden_dim=64,              # For GraphSAGE/GAT
         num_layers=3,
+        num_heads=4,                # For GAT only
         num_epochs=100,             # Will auto-adjust if None
         batch_size=4096,
         learning_rate=5e-3,
