@@ -11,6 +11,14 @@ from torch_scatter import scatter_add
 from torch_geometric.utils import degree
 from torch_geometric.nn import SAGEConv, GATConv
 
+
+data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Data')
+train_data = torch.load(os.path.join(data_dir, 'train_data.pt'), weights_only=False)
+val_data   = torch.load(os.path.join(data_dir, 'val_data.pt'), weights_only=False)
+test_data  = torch.load(os.path.join(data_dir, 'test_data.pt'), weights_only=False)
+with open(os.path.join(data_dir, 'node_mapping.pkl'), 'rb') as f:
+        node_mapping = pickle.load(f)
+
 # ==============================================================================
 # UTILITY FUNCTIONS
 # ==============================================================================
@@ -45,18 +53,53 @@ def build_next_link_labels(edge_index, edge_times):
 
 
 def build_all_future_labels(edge_index, edge_times):
-    """Build all positive pairs (s -> d_later) for any later edge within window."""
-    per_src = edges_to_sorted_lists(edge_index, edge_times)
-    pos_src = []
-    pos_dst = []
-    for s, events in per_src.items():
-        for i in range(len(events)):
-            for j in range(i + 1, len(events)):
-                pos_src.append(s)
-                pos_dst.append(events[j][1])
-    if len(pos_src) == 0:
-        return torch.empty((2, 0), dtype=torch.long)
-    return torch.tensor([pos_src, pos_dst], dtype=torch.long)
+    """
+    Vectorized generation of future training pairs.
+    Instead of O(N^2) loops, we sample pairs (t_current, t_future) where t_future > t_current.
+    """
+    # 1. Sort everything by Source (primary) then Time (secondary)
+    src, dst = edge_index
+    perm = edge_times.argsort(stable=True)
+    perm = src[perm].argsort(stable=True)  # Stable sort preserves time order within user
+    src, dst = src[perm], dst[perm]
+
+    # 2. Group by Source using split (avoiding python dict overhead)
+    unique_srcs, counts = torch.unique_consecutive(src, return_counts=True)
+    user_timelines = torch.split(dst, counts.tolist())
+
+    out_srcs, out_targets = [], []
+    MAX_PAIRS = 50  # Hard cap: max training pairs per user per epoch
+
+    # 3. Process per-user timelines
+    for user_id, timeline in zip(unique_srcs, user_timelines):
+        n = len(timeline)
+        if n < 2: continue
+
+        # If user history is short, take ALL valid future pairs (upper triangle)
+        # This preserves the original "dense" logic for sparse users
+        if (n * (n - 1) / 2) <= MAX_PAIRS:
+            # triu_indices(offset=1) gives all (i, j) where j > i
+            _, target_indices = torch.triu_indices(n, n, offset=1, device=edge_index.device)
+
+        # If user history is long, SAMPLE to avoid memory explosion
+        else:
+            # Generate random pairs of indices and sort them so row < col
+            pairs = torch.randint(0, n, (2, MAX_PAIRS), device=edge_index.device)
+            # sort(dim=0) ensures row_idx < col_idx (past < future)
+            pairs, _ = torch.sort(pairs, dim=0)
+
+            # Filter out identical indices (i == j) if any
+            mask = pairs[0] != pairs[1]
+            target_indices = pairs[1][mask]
+
+        # Append data: Source is always the User, Target is the future item
+        out_srcs.append(user_id.repeat(len(target_indices)))
+        out_targets.append(timeline[target_indices])
+
+    if not out_srcs: # Handle edge case of no valid pairs
+        return torch.empty((2, 0), dtype=torch.long, device=edge_index.device)
+
+    return torch.stack([torch.cat(out_srcs), torch.cat(out_targets)])
 
 
 def build_next_labels_from_splits(train_edge_index, train_edge_times, val_data, test_data):
@@ -100,7 +143,7 @@ def sample_hard_negative_edges_grouped(batch_src, adj, num_nodes, num_neg=5, dev
     """Sample hard negative edges (neighbors of neighbors that aren't direct neighbors)."""
     neg_src_list, neg_dst_list = [], []
     src_list = batch_src.cpu().tolist()
-    
+
     for s in src_list:
         neighbors = adj[s]
         candidates = set()
@@ -108,7 +151,7 @@ def sample_hard_negative_edges_grouped(batch_src, adj, num_nodes, num_neg=5, dev
             candidates.update(adj[nbr])
         candidates.discard(s)
         candidates.difference_update(neighbors)
-        
+
         if len(candidates) == 0:
             sampled = torch.randint(0, num_nodes, (num_neg,), device=device, dtype=torch.long)
         else:
@@ -136,17 +179,17 @@ def sample_hard_negative_edges_grouped(batch_src, adj, num_nodes, num_neg=5, dev
 class MetricsComputer:
     """
     Compute link prediction metrics: Hit@K, Recall@K, MRR, NDCG@K, AUC, Mean Rank.
-    
+
     For single-relevant-item evaluation (next-link prediction):
     - Hit@K = Recall@K (binary: did we rank the true item in top K?)
     - MRR = Mean Reciprocal Rank = mean(1/rank)
     - NDCG@K = Normalized DCG = 1/log2(rank+1) if rank <= K, else 0
     - AUC approximated via pos vs neg score comparison
     """
-    
+
     def __init__(self, ks: List[int] = [10, 20, 50]):
         self.ks = sorted(ks)
-    
+
     @torch.no_grad()
     def compute_ranking_metrics(
         self,
@@ -157,64 +200,64 @@ class MetricsComputer:
     ) -> Dict[str, float]:
         """
         Compute all ranking metrics from embeddings and labels.
-        
+
         Args:
             emb: Node embeddings [num_nodes, dim]
             labels: [2, num_labels] source-destination pairs
             batch_size: Batch size for computation
             device: Device for computation
-            
+
         Returns:
             Dict with metrics: hit@k, mrr, ndcg@k, mean_rank for each k
         """
         labels = labels.to(device)
         emb = emb.to(device)
         num_pos = labels.size(1)
-        
+
         if num_pos == 0:
             return {f'hit@{k}': 0.0 for k in self.ks} | {'mrr': 0.0, 'mean_rank': 0.0} | {f'ndcg@{k}': 0.0 for k in self.ks}
-        
+
         all_ranks = []
-        
+
         for start in range(0, num_pos, batch_size):
             end = min(start + batch_size, num_pos)
             batch_src = labels[0, start:end]
             batch_dst = labels[1, start:end]
             actual_batch_size = end - start
-            
+
             # Compute scores for all candidates
             batch_emb = emb[batch_src]  # [B, dim]
             scores = batch_emb @ emb.t()  # [B, num_nodes]
-            
+
             # Get true scores and compute ranks
             true_scores = scores[torch.arange(actual_batch_size, device=device), batch_dst]
             # Rank = number of items with score >= true score (1-indexed)
             ranks = (scores >= true_scores.unsqueeze(1)).sum(dim=1)
             all_ranks.append(ranks)
-        
+
         ranks = torch.cat(all_ranks).float()
-        
+
         # Compute metrics
         metrics = {}
-        
+
         # Hit@K (same as Recall@K for single relevant item)
         for k in self.ks:
             metrics[f'hit@{k}'] = (ranks <= k).float().mean().item()
-        
+
         # MRR - Mean Reciprocal Rank
         metrics['mrr'] = (1.0 / ranks).mean().item()
-        
+
         # NDCG@K - for single relevant item: 1/log2(rank+1) if rank <= K
         for k in self.ks:
             # NDCG = DCG / IDCG, where IDCG = 1/log2(2) = 1 for single item at rank 1
             dcg = torch.where(ranks <= k, 1.0 / torch.log2(ranks + 1), torch.zeros_like(ranks))
             metrics[f'ndcg@{k}'] = dcg.mean().item()
-        
+
         # Mean Rank
         metrics['mean_rank'] = ranks.mean().item()
-        
+
         return metrics
-    
+
     @torch.no_grad()
     def compute_auc(
         self,
@@ -228,30 +271,30 @@ class MetricsComputer:
     ) -> float:
         """
         Compute AUC by comparing positive scores vs negative scores.
-        
+
         AUC = P(pos_score > neg_score) approximated via sampling.
         """
         model.eval()
         pos_labels = pos_labels.to(device)
         mp_edge_index = mp_edge_index.to(device)
         emb = model(mp_edge_index)
-        
+
         num_pos = pos_labels.size(1)
         if num_pos == 0:
             return 0.5
-        
+
         total_correct = 0
         total_comparisons = 0
-        
+
         for start in range(0, num_pos, batch_size):
             end = min(start + batch_size, num_pos)
             batch_src = pos_labels[0, start:end]
             batch_dst = pos_labels[1, start:end]
             actual_batch_size = end - start
-            
+
             # Positive scores
             pos_scores = (emb[batch_src] * emb[batch_dst]).sum(dim=1)  # [B]
-            
+
             # Sample negatives and compute scores
             neg_edge_index = sample_hard_negative_edges_grouped(
                 batch_src, adj, model.num_nodes, num_neg=num_neg_samples, device=device
@@ -259,13 +302,13 @@ class MetricsComputer:
             neg_src = neg_edge_index[0].view(actual_batch_size, num_neg_samples)
             neg_dst = neg_edge_index[1].view(actual_batch_size, num_neg_samples)
             neg_scores = (emb[neg_src] * emb[neg_dst]).sum(dim=2)  # [B, num_neg]
-            
+
             # AUC: count how often pos > neg
             # pos_scores: [B], neg_scores: [B, num_neg]
             comparisons = (pos_scores.unsqueeze(1) > neg_scores).float()
             total_correct += comparisons.sum().item()
             total_comparisons += comparisons.numel()
-        
+
         return total_correct / max(total_comparisons, 1)
 
 
@@ -275,27 +318,27 @@ class MetricsComputer:
 
 class MetricsHistory:
     """Track metrics over training for plotting."""
-    
+
     def __init__(self):
         self.history = defaultdict(list)
         self.epochs = []
-    
+
     def log(self, epoch: int, metrics: Dict[str, float], prefix: str = ''):
         """Log metrics for an epoch."""
         if epoch not in self.epochs:
             self.epochs.append(epoch)
-        
+
         for key, value in metrics.items():
             full_key = f'{prefix}{key}' if prefix else key
             self.history[full_key].append(value)
-    
+
     def get_history(self) -> Dict[str, Any]:
         """Get full history dict for plotting."""
         return {
             'epochs': self.epochs.copy(),
             **{k: v.copy() for k, v in self.history.items()}
         }
-    
+
     def print_summary(self, epoch: int, prefix: str = ''):
         """Print a summary of metrics for the epoch."""
         print(f"\n{prefix}Metrics at epoch {epoch}:")
@@ -310,11 +353,12 @@ class MetricsHistory:
 
 class LightGCN(nn.Module):
     """LightGCN: Simplifying and Powering Graph Convolution Network for Recommendation."""
-    
-    def __init__(self, num_nodes, embedding_dim=64, num_layers=3):
+
+    def __init__(self, num_nodes, embedding_dim=64, num_layers=3, dropout=0.0):
         super().__init__()
         self.num_nodes = num_nodes
         self.num_layers = num_layers
+        self.dropout = dropout
         self.embedding = nn.Embedding(num_nodes, embedding_dim)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
 
@@ -328,25 +372,28 @@ class LightGCN(nn.Module):
 
     def forward(self, edge_index):
         x = self.embedding.weight
+        x = F.dropout(x, p=self.dropout, training=self.training)
         out = [x]
         for _ in range(self.num_layers):
             x = self.propagate(edge_index, x)
             x = x + out[-1] if len(out) > 0 else x
             x = F.normalize(x, p=2, dim=1)
+            x = F.dropout(x, p=self.dropout, training=self.training)
             out.append(x)
         return torch.stack(out, dim=0).mean(dim=0)
 
 
 class GraphSAGE(nn.Module):
     """GraphSAGE: Inductive Representation Learning on Large Graphs."""
-    
-    def __init__(self, num_nodes, embedding_dim=64, hidden_dim=64, num_layers=2):
+
+    def __init__(self, num_nodes, embedding_dim=64, hidden_dim=64, num_layers=2, dropout=0.0):
         super().__init__()
         self.num_nodes = num_nodes
         self.num_layers = num_layers
+        self.dropout = dropout
         self.embedding = nn.Embedding(num_nodes, embedding_dim)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
-        
+
         self.convs = nn.ModuleList()
         self.convs.append(SAGEConv(embedding_dim, hidden_dim))
         for _ in range(num_layers - 1):
@@ -354,32 +401,37 @@ class GraphSAGE(nn.Module):
 
     def forward(self, edge_index):
         x = self.embedding.weight
+        x = F.dropout(x, p=self.dropout, training=self.training)
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
             if i < len(self.convs) - 1:
                 x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
         return F.normalize(x, p=2, dim=1)
 
 
 class GAT(nn.Module):
     """GAT: Graph Attention Networks."""
-    
-    def __init__(self, num_nodes, embedding_dim=64, hidden_dim=64, num_layers=2, heads=4):
+
+    def __init__(self, num_nodes, embedding_dim=64, hidden_dim=64, num_layers=2, heads=4, dropout=0.0):
         super().__init__()
         self.num_nodes = num_nodes
         self.num_layers = num_layers
+        self.dropout = dropout
         self.embedding = nn.Embedding(num_nodes, embedding_dim)
         nn.init.normal_(self.embedding.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
-        
+
         self.convs = nn.ModuleList()
-        self.convs.append(GATConv(embedding_dim, hidden_dim // heads, heads=heads, concat=True))
+        # GATConv has built-in dropout for attention coefficients
+        self.convs.append(GATConv(embedding_dim, hidden_dim // heads, heads=heads, concat=True, dropout=dropout))
         for _ in range(num_layers - 2):
-            self.convs.append(GATConv(hidden_dim, hidden_dim // heads, heads=heads, concat=True))
+            self.convs.append(GATConv(hidden_dim, hidden_dim // heads, heads=heads, concat=True, dropout=dropout))
         if num_layers > 1:
-            self.convs.append(GATConv(hidden_dim, hidden_dim, heads=1, concat=False))
+            self.convs.append(GATConv(hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout))
 
     def forward(self, edge_index):
         x = self.embedding.weight
+        x = F.dropout(x, p=self.dropout, training=self.training)
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
             if i < len(self.convs) - 1:
@@ -389,7 +441,7 @@ class GAT(nn.Module):
 
 class BPRLoss(nn.Module):
     """Bayesian Personalized Ranking Loss."""
-    
+
     def __init__(self, lambda_reg: float = 1e-5):
         super().__init__()
         self.lambda_reg = lambda_reg
@@ -420,7 +472,7 @@ def train_one_epoch_bpr(
 ) -> Dict[str, float]:
     """
     Train one epoch with BPR loss.
-    
+
     Returns:
         Dict with 'bpr_loss' and 'auc_train' (approximate AUC on training batch)
     """
@@ -428,14 +480,14 @@ def train_one_epoch_bpr(
     train_labels = train_labels.to(device)
     mp_edge_index = mp_edge_index.to(device)
     num_pos = train_labels.size(1)
-    
+
     total_loss = 0.0
     total_auc_correct = 0
     total_auc_comparisons = 0
 
     loss_fn = BPRLoss(lambda_reg=1e-5)
     num_batches = (num_pos + batch_size - 1) // batch_size
-    
+
     for batch_idx, start in enumerate(range(0, num_pos, batch_size)):
         end = min(start + batch_size, num_pos)
         batch_src = train_labels[0, start:end]
@@ -464,13 +516,13 @@ def train_one_epoch_bpr(
         optimizer.step()
 
         total_loss += loss.item() * actual_batch_size
-        
+
         # Track AUC during training (pos > neg comparisons)
         with torch.no_grad():
             comparisons = (pos_score > neg_score).float()
             total_auc_correct += comparisons.sum().item()
             total_auc_comparisons += comparisons.numel()
-        
+
         if verbose and (batch_idx + 1) % max(1, num_batches // 5) == 0:
             print(f"  Batch {batch_idx + 1}/{num_batches} | Loss: {loss.item():.4f}", end='\r')
 
@@ -498,21 +550,21 @@ def compute_bpr_loss(
     labels = labels.to(device)
     mp_edge_index = mp_edge_index.to(device)
     num_pos = labels.size(1)
-    
+
     if num_pos == 0:
         return 0.0
-    
+
     total_loss = 0.0
     loss_fn = BPRLoss(lambda_reg=0.0)  # No regularization for eval
-    
+
     emb = model(mp_edge_index)
-    
+
     for start in range(0, num_pos, batch_size):
         end = min(start + batch_size, num_pos)
         batch_src = labels[0, start:end]
         batch_dst = labels[1, start:end]
         actual_batch_size = end - start
-        
+
         neg_edge_index = sample_hard_negative_edges_grouped(
             batch_src=batch_src,
             adj=adj,
@@ -522,13 +574,13 @@ def compute_bpr_loss(
         )
         neg_src = neg_edge_index[0].view(actual_batch_size, num_neg)
         neg_dst = neg_edge_index[1].view(actual_batch_size, num_neg)
-        
+
         pos_score = (emb[batch_src] * emb[batch_dst]).sum(dim=1, keepdim=True)
         neg_score = (emb[neg_src] * emb[neg_dst]).sum(dim=2)
-        
+
         loss = loss_fn(pos_score, neg_score)
         total_loss += loss.item() * actual_batch_size
-    
+
     return total_loss / num_pos
 
 
@@ -547,14 +599,14 @@ def evaluate(
 ) -> Dict[str, float]:
     """
     Comprehensive evaluation with all metrics.
-    
+
     Returns:
         Dict with: hit@k, mrr, ndcg@k, mean_rank, auc, bpr_loss for each k in metrics_computer.ks
     """
     model.eval()
     mp_edge_index = mp_edge_index.to(device)
     emb = model(mp_edge_index)
-    
+
     # Compute ranking metrics
     metrics = metrics_computer.compute_ranking_metrics(
         emb=emb,
@@ -562,7 +614,7 @@ def evaluate(
         batch_size=batch_size,
         device=device
     )
-    
+
     # Compute AUC
     if compute_auc:
         auc = metrics_computer.compute_auc(
@@ -575,7 +627,7 @@ def evaluate(
             device=device
         )
         metrics['auc'] = auc
-    
+
     # Compute BPR loss on validation set
     if compute_bpr:
         bpr_loss = compute_bpr_loss(
@@ -588,32 +640,8 @@ def evaluate(
             device=device
         )
         metrics['bpr_loss'] = bpr_loss
-    
+
     return metrics
-
-
-# ==============================================================================
-# DATA LOADING
-# ==============================================================================
-
-def load_data(data_dir: str):
-    """Load train/val/test data and node mapping from directory."""
-    print("Loading datasets...")
-    start_time = time.time()
-    train_data = torch.load(os.path.join(data_dir, "train_data.pt"), weights_only=False)
-    val_data = torch.load(os.path.join(data_dir, "val_data.pt"), weights_only=False)
-    test_data = torch.load(os.path.join(data_dir, "test_data.pt"), weights_only=False)
-    print(f"Datasets loaded in {time.time() - start_time:.2f}s")
-
-    with open(os.path.join(data_dir, "node_mapping.pkl"), "rb") as f:
-        node_mapping = pickle.load(f)
-    
-    print(f"Train edges: {train_data.edge_index.size(1):,}, "
-          f"Val edges: {val_data.edge_index.size(1):,}, "
-          f"Test edges: {test_data.edge_index.size(1):,}")
-    
-    return train_data, val_data, test_data, node_mapping
-
 
 # ==============================================================================
 # MAIN TRAINING PIPELINE
@@ -623,12 +651,13 @@ def train_pipeline(
     data_dir: str = None,
     model_type: str = "lightgcn",
     training_mode: str = "next_link",
-    use_subset: bool = True,
+    use_subset: bool = False,
     subset_frac: float = 0.1,
     embedding_dim: int = 64,
     hidden_dim: int = 64,
     num_layers: int = 3,
     num_heads: int = 4,
+    dropout: float = 0.0,
     num_epochs: int = None,
     batch_size: int = 4096,
     learning_rate: float = 5e-3,
@@ -642,7 +671,7 @@ def train_pipeline(
 ) -> Dict[str, Any]:
     """
     Run the complete GNN training pipeline for link prediction.
-    
+
     Args:
         data_dir: Path to data directory. If None, uses 'Data' folder next to this script.
         model_type: GNN architecture - "lightgcn", "graphsage", or "gat"
@@ -653,6 +682,7 @@ def train_pipeline(
         hidden_dim: Hidden dimension for GraphSAGE/GAT (ignored for LightGCN)
         num_layers: Number of GNN layers
         num_heads: Number of attention heads for GAT (ignored for others)
+        dropout: Dropout rate for regularization (0.0 = no dropout, 0.5 = 50% dropout)
         num_epochs: Number of training epochs. If None, uses 100 for subset, 10 for full.
         batch_size: Training batch size
         learning_rate: Learning rate for Adam optimizer
@@ -663,7 +693,7 @@ def train_pipeline(
         verbose: Whether to print training progress
         save_results_to: Directory to save results. If None, results are not saved.
         run_name: Name for this run. If None, auto-generated from model_type and training_mode.
-        
+
     Returns:
         dict with:
         - 'model': trained model
@@ -675,37 +705,29 @@ def train_pipeline(
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    
-    # Setup data directory
-    if data_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_dir = os.path.join(script_dir, "Data")
-    
+
     # Initialize metrics tracking
     metrics_computer = MetricsComputer(ks=eval_ks)
     history = MetricsHistory()
-    
-    # Load data
-    train_data, val_data, test_data, node_mapping = load_data(data_dir)
-    
+
     # ==== SETUP TRAINING DATA ====
     print("\n" + "=" * 60)
     print("SETTING UP TRAINING DATA")
     print("=" * 60)
-    
+
     num_nodes = train_data.x.size(0)
     mp_edge_index = train_data.edge_index
     train_edge_times = train_data.edge_attr[:, 2]
-    
+
     if use_subset:
         print(f"QUICK ITERATION MODE: Using {subset_frac * 100:.0f}% of training data")
         num_edges_to_use = int(mp_edge_index.size(1) * subset_frac)
         mp_edge_index = mp_edge_index[:, :num_edges_to_use]
         train_edge_times = train_edge_times[:num_edges_to_use]
-    
+
     print(f"Number of nodes: {num_nodes:,}")
     print(f"Training edges: {mp_edge_index.size(1):,}")
-    
+
     # Build training labels based on mode
     print(f"Building training labels (mode: {training_mode})...")
     start_time = time.time()
@@ -717,7 +739,7 @@ def train_pipeline(
         raise ValueError(f"Unknown training_mode: {training_mode}. Use 'next_link' or 'all_future'.")
     print(f"Training labels built in {time.time() - start_time:.2f}s")
     print(f"Number of positive pairs: {train_labels.size(1):,}")
-    
+
     # Subset labels if too many
     max_labels_threshold = 50000 if training_mode == "next_link" else 10000
     if use_subset and train_labels.size(1) > max_labels_threshold:
@@ -725,7 +747,7 @@ def train_pipeline(
         perm = torch.randperm(train_labels.size(1))[:max_labels_threshold]
         train_labels = train_labels[:, perm]
         print(f"Using {train_labels.size(1):,} training pairs")
-    
+
     # Build val/test labels
     print("Building validation/test labels...")
     start_time = time.time()
@@ -734,7 +756,7 @@ def train_pipeline(
     )
     print(f"Val/Test labels built in {time.time() - start_time:.2f}s")
     print(f"Validation labels: {val_labels.size(1):,}, Test labels: {test_labels.size(1):,}")
-    
+
     # Build adjacency list
     print("Building global adjacency list...")
     start_time = time.time()
@@ -742,79 +764,80 @@ def train_pipeline(
     print(f"Global adjacency list built in {time.time() - start_time:.2f}s")
     avg_degree = sum(len(a) for a in adj) / num_nodes
     print(f"Average node degree: {avg_degree:.2f}")
-    
+
     # ==== INITIALIZE MODEL ====
     print("\n" + "=" * 60)
     print(f"INITIALIZING MODEL: {model_type.upper()}")
     print("=" * 60)
-    
+
     if model_type == "lightgcn":
-        model = LightGCN(num_nodes=num_nodes, embedding_dim=embedding_dim, num_layers=num_layers)
+        model = LightGCN(num_nodes=num_nodes, embedding_dim=embedding_dim,
+                         num_layers=num_layers, dropout=dropout)
     elif model_type == "graphsage":
-        model = GraphSAGE(num_nodes=num_nodes, embedding_dim=embedding_dim, 
-                         hidden_dim=hidden_dim, num_layers=num_layers)
+        model = GraphSAGE(num_nodes=num_nodes, embedding_dim=embedding_dim,
+                         hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout)
     elif model_type == "gat":
         model = GAT(num_nodes=num_nodes, embedding_dim=embedding_dim,
-                   hidden_dim=hidden_dim, num_layers=num_layers, heads=num_heads)
+                   hidden_dim=hidden_dim, num_layers=num_layers, heads=num_heads, dropout=dropout)
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'lightgcn', 'graphsage', or 'gat'.")
-    
+
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
+
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {model_type}")
     print(f"Parameters: {num_params:,}")
     print(f"Device: {next(model.parameters()).device}")
     print(f"Evaluation K values: {eval_ks}")
-    
+
     # ==== TRAINING ====
     print("\n" + "=" * 60)
     print("STARTING TRAINING")
     print("=" * 60)
-    
+
     if num_epochs is None:
         num_epochs = 100 if use_subset else 10
     if eval_freq is None:
-        eval_freq = 1 if use_subset else 5
-    
+        eval_freq = 1 if use_subset else 1
+
     mp_edge_index = mp_edge_index.to(device)
-    
+
     for epoch in range(num_epochs):
         epoch_start = time.time()
         if verbose:
             print(f"\n{'='*60}")
             print(f"Epoch {epoch + 1}/{num_epochs}")
             print('='*60)
-        
+
         # Train
         train_metrics = train_one_epoch_bpr(
             model, optimizer, train_labels, mp_edge_index, adj,
             num_neg=num_neg, batch_size=batch_size, device=device, verbose=verbose
         )
-        
+
         # Log training metrics
         history.log(epoch, train_metrics, prefix='train_')
-        
+
         epoch_time = time.time() - epoch_start
         if verbose:
             print(f"\n  Train Loss: {train_metrics['bpr_loss']:.4f} | "
                   f"Train AUC: {train_metrics['auc_train']:.4f} | "
                   f"Time: {epoch_time:.2f}s")
-        
+
         # Evaluate
         if epoch % eval_freq == 0 or epoch == num_epochs - 1:
             if verbose:
                 print("  Running validation...")
             eval_start = time.time()
-            
+
             val_metrics = evaluate(
                 model, mp_edge_index, val_labels, adj, metrics_computer,
-                num_neg=num_neg, batch_size=2048, device=device, 
+                num_neg=num_neg, batch_size=2048, device=device,
                 compute_auc=True, compute_bpr=True
             )
             history.log(epoch, val_metrics, prefix='val_')
-            
+
             eval_time = time.time() - eval_start
             if verbose:
                 k_main = eval_ks[0]
@@ -824,44 +847,44 @@ def train_pipeline(
                       f"AUC: {val_metrics['auc']:.4f} | "
                       f"MR: {val_metrics['mean_rank']:.1f} | "
                       f"Time: {eval_time:.2f}s")
-    
+
     # ==== FINAL EVALUATION ====
     print("\n" + "=" * 60)
     print("FINAL EVALUATION")
     print("=" * 60)
-    
+
     final_val_metrics = evaluate(
         model, mp_edge_index, val_labels, adj, metrics_computer,
-        num_neg=num_neg, batch_size=2048, device=device, 
+        num_neg=num_neg, batch_size=2048, device=device,
         compute_auc=True, compute_bpr=True
     )
-    
+
     final_test_metrics = evaluate(
         model, mp_edge_index, test_labels, adj, metrics_computer,
-        num_neg=num_neg, batch_size=2048, device=device, 
+        num_neg=num_neg, batch_size=2048, device=device,
         compute_auc=True, compute_bpr=True
     )
-    
+
     print("\nValidation Metrics:")
     for k, v in sorted(final_val_metrics.items()):
         print(f"  {k}: {v:.4f}")
-    
+
     print("\nTest Metrics:")
     for k, v in sorted(final_test_metrics.items()):
         print(f"  {k}: {v:.4f}")
-    
+
     results = {
         'model': model,
         'history': history.get_history(),
         'final_val_metrics': final_val_metrics,
         'final_test_metrics': final_test_metrics,
     }
-    
+
     # Auto-save results if requested
     if save_results_to is not None:
         if run_name is None:
             run_name = f"{model_type}_{training_mode}"
-        
+
         config = {
             'model_type': model_type,
             'training_mode': training_mode,
@@ -871,6 +894,7 @@ def train_pipeline(
             'hidden_dim': hidden_dim,
             'num_layers': num_layers,
             'num_heads': num_heads,
+            'dropout': dropout,
             'num_epochs': num_epochs,
             'batch_size': batch_size,
             'learning_rate': learning_rate,
@@ -878,7 +902,7 @@ def train_pipeline(
             'eval_ks': eval_ks,
         }
         save_results(results, run_name, save_results_to, config)
-    
+
     return results
 
 
@@ -889,7 +913,7 @@ def train_pipeline(
 def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = None):
     """
     Plot training curves from history dict.
-    
+
     Args:
         history: Dict from MetricsHistory.get_history()
         save_path: Optional path to save figure
@@ -899,13 +923,13 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     except ImportError:
         print("matplotlib not installed. Install with: pip install matplotlib")
         return
-    
+
     epochs = history['epochs']
-    
+
     # Create figure with subplots
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     fig.suptitle('Training Curves', fontsize=14)
-    
+
     # Plot 1: BPR Loss (Train vs Val)
     ax = axes[0, 0]
     if 'train_bpr_loss' in history:
@@ -918,7 +942,7 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     ax.set_title('BPR Loss (Train vs Val)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     # Plot 2: AUC
     ax = axes[0, 1]
     if 'train_auc_train' in history:
@@ -931,7 +955,7 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     ax.set_title('AUC')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     # Plot 3: Hit@K
     ax = axes[0, 2]
     for key in sorted(history.keys()):
@@ -944,7 +968,7 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     ax.set_title('Hit@K (Validation)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     # Plot 4: MRR
     ax = axes[1, 0]
     if 'val_mrr' in history:
@@ -955,7 +979,7 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     ax.set_title('Mean Reciprocal Rank')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     # Plot 5: NDCG@K
     ax = axes[1, 1]
     for key in sorted(history.keys()):
@@ -968,7 +992,7 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     ax.set_title('NDCG@K (Validation)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     # Plot 6: Mean Rank
     ax = axes[1, 2]
     if 'val_mean_rank' in history:
@@ -979,13 +1003,13 @@ def plot_training_curves(history: Dict[str, Any], save_path: Optional[str] = Non
     ax.set_title('Mean Rank (lower is better)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Figure saved to {save_path}")
-    
+
     plt.show()
 
 
@@ -1001,20 +1025,20 @@ def save_results(
 ) -> str:
     """
     Save training results to disk for later comparison.
-    
+
     Args:
         results: Dict returned from train_pipeline()
         run_name: Unique name for this run (e.g., "lightgcn_next_link")
         save_dir: Directory to save results
         config: Optional config dict to save alongside results
-        
+
     Returns:
         Path to saved file
     """
     import json
-    
+
     os.makedirs(save_dir, exist_ok=True)
-    
+
     # Create saveable dict (exclude model, which isn't JSON serializable)
     save_data = {
         'run_name': run_name,
@@ -1023,37 +1047,37 @@ def save_results(
         'final_val_metrics': results['final_val_metrics'],
         'final_test_metrics': results['final_test_metrics'],
     }
-    
+
     if config is not None:
         save_data['config'] = config
-    
+
     filepath = os.path.join(save_dir, f"{run_name}.json")
     with open(filepath, 'w') as f:
         json.dump(save_data, f, indent=2)
-    
+
     print(f"Results saved to {filepath}")
-    
+
     # Also save model separately
     model_path = os.path.join(save_dir, f"{run_name}_model.pt")
     torch.save(results['model'].state_dict(), model_path)
     print(f"Model saved to {model_path}")
-    
+
     return filepath
 
 
 def load_results(run_name: str, save_dir: str = "results") -> Dict[str, Any]:
     """
     Load saved results from disk.
-    
+
     Args:
         run_name: Name of the run to load
         save_dir: Directory where results are saved
-        
+
     Returns:
         Dict with history, final_val_metrics, final_test_metrics, config
     """
     import json
-    
+
     filepath = os.path.join(save_dir, f"{run_name}.json")
     with open(filepath, 'r') as f:
         return json.load(f)
@@ -1074,7 +1098,7 @@ def compare_runs(
 ) -> None:
     """
     Create comparison plots and table for multiple runs.
-    
+
     Args:
         run_names: List of run names to compare
         save_dir: Directory where results are saved
@@ -1086,7 +1110,7 @@ def compare_runs(
     except ImportError:
         print("matplotlib not installed. Install with: pip install matplotlib")
         return
-    
+
     # Load all runs
     runs = {}
     for name in run_names:
@@ -1094,23 +1118,23 @@ def compare_runs(
             runs[name] = load_results(name, save_dir)
         except FileNotFoundError:
             print(f"Warning: Could not find results for {name}")
-    
+
     if not runs:
         print("No runs found to compare!")
         return
-    
+
     # Print comparison table
     print("\n" + "=" * 80)
     print("FINAL METRICS COMPARISON")
     print("=" * 80)
-    
+
     # Header
     header = f"{'Metric':<15}"
     for name in runs:
         header += f"{name:<20}"
     print(header)
     print("-" * 80)
-    
+
     # Rows for each metric (validation)
     print("\nValidation:")
     for metric in metrics_to_compare:
@@ -1119,7 +1143,7 @@ def compare_runs(
             val = data['final_val_metrics'].get(metric, float('nan'))
             row += f"{val:<20.4f}"
         print(row)
-    
+
     # Rows for each metric (test)
     print("\nTest:")
     for metric in metrics_to_compare:
@@ -1128,42 +1152,42 @@ def compare_runs(
             val = data['final_test_metrics'].get(metric, float('nan'))
             row += f"{val:<20.4f}"
         print(row)
-    
+
     # Create comparison plots
     num_metrics = len(metrics_to_compare)
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     fig.suptitle('Training Curves Comparison', fontsize=14)
     axes = axes.flatten()
-    
+
     colors = plt.cm.tab10(range(len(runs)))
-    
+
     # Plot training curves for key metrics
     plot_metrics = ['val_bpr_loss', 'val_auc', 'val_hit@10', 'val_mrr', 'val_ndcg@10', 'val_mean_rank']
     titles = ['BPR Loss', 'AUC', 'Hit@10', 'MRR', 'NDCG@10', 'Mean Rank']
-    
+
     for idx, (metric, title) in enumerate(zip(plot_metrics, titles)):
         if idx >= len(axes):
             break
         ax = axes[idx]
-        
+
         for (name, data), color in zip(runs.items(), colors):
             history = data['history']
             if metric in history:
                 epochs = history['epochs'][:len(history[metric])]
                 ax.plot(epochs, history[metric], '-', color=color, label=name, linewidth=2)
-        
+
         ax.set_xlabel('Epoch')
         ax.set_ylabel(title)
         ax.set_title(title)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"\nComparison figure saved to {save_path}")
-    
+
     plt.show()
 
 
@@ -1175,13 +1199,13 @@ def create_final_metrics_table(
 ) -> Optional[Any]:
     """
     Create a pandas DataFrame comparing final metrics across runs.
-    
+
     Args:
         run_names: List of run names to compare
         save_dir: Directory where results are saved
         metrics: Metrics to include
         save_path: Optional CSV path to save table
-        
+
     Returns:
         pandas DataFrame if pandas is installed, else None
     """
@@ -1190,7 +1214,7 @@ def create_final_metrics_table(
     except ImportError:
         print("pandas not installed. Install with: pip install pandas")
         return None
-    
+
     rows = []
     for name in run_names:
         try:
@@ -1198,87 +1222,47 @@ def create_final_metrics_table(
             row = {'run': name, 'split': 'val'}
             row.update({m: data['final_val_metrics'].get(m, float('nan')) for m in metrics})
             rows.append(row)
-            
+
             row = {'run': name, 'split': 'test'}
             row.update({m: data['final_test_metrics'].get(m, float('nan')) for m in metrics})
             rows.append(row)
         except FileNotFoundError:
             print(f"Warning: Could not find {name}")
-    
+
     df = pd.DataFrame(rows)
-    
+
     if save_path:
         df.to_csv(save_path, index=False)
         print(f"Table saved to {save_path}")
-    
+
     return df
 
 
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
-
 if __name__ == "__main__":
     # ===========================================================================
     # EXAMPLE 1: Train a single model and save results
     # ===========================================================================
     results = train_pipeline(
-        model_type="lightgcn",      # "lightgcn", "graphsage", or "gat"
-        training_mode="next_link",  # "next_link" or "all_future"
-        use_subset=True,            # Set to False for full training
+        model_type="gat",      # "lightgcn", "graphsage", or "gat"
+        training_mode="all_future",  # "next_link" or "all_future"
+        use_subset=False,           # Set to False for full training
         subset_frac=0.1,
         embedding_dim=64,
         hidden_dim=64,
         num_layers=3,
         num_heads=4,
+        dropout=0.3,                # Dropout rate (0.0-0.5 recommended)
         num_epochs=50,
         batch_size=4096,
-        learning_rate=5e-3,
+        learning_rate=1e-4,
         num_neg=5,
-        eval_ks=[10, 20, 50],       # K values for Hit@K, NDCG@K
+        eval_ks=[10, 20, 50, 100, 500],       # K values for Hit@K, NDCG@K
         save_results_to="results",  # Save to results/ directory
-        run_name="lightgcn_next_link",  # Name for this run
+        run_name="gat_all_future",  # Name for this run
     )
-    
+
     # Plot training curves for this run
-    plot_training_curves(results['history'], save_path='results/lightgcn_next_link_curves.png')
-    
-    # ===========================================================================
-    # EXAMPLE 2: Train multiple models and compare them
-    # ===========================================================================
-    # Uncomment to run all models:
-    # 
-    # for model_type in ["lightgcn", "graphsage", "gat"]:
-    #     for training_mode in ["next_link", "all_future"]:
-    #         train_pipeline(
-    #             model_type=model_type,
-    #             training_mode=training_mode,
-    #             use_subset=True,
-    #             num_epochs=50,
-    #             save_results_to="results",
-    #             run_name=f"{model_type}_{training_mode}",
-    #         )
-    # 
-    # # Compare all runs
-    # compare_runs(
-    #     run_names=["lightgcn_next_link", "graphsage_next_link", "gat_next_link"],
-    #     save_dir="results",
-    #     save_path="results/model_comparison.png"
-    # )
-    # 
-    # # Create comparison table
-    # df = create_final_metrics_table(
-    #     run_names=list_saved_runs("results"),
-    #     save_dir="results",
-    #     save_path="results/metrics_table.csv"
-    # )
-    # print(df)
-    
-    # ===========================================================================
-    # EXAMPLE 3: Load and compare previously saved runs
-    # ===========================================================================
-    # saved_runs = list_saved_runs("results")
-    # print(f"Found saved runs: {saved_runs}")
-    # 
-    # if len(saved_runs) >= 2:
-    #     compare_runs(saved_runs, save_dir="results")
+    plot_training_curves(results['history'], save_path='results/gat_all_future_curves.png')
